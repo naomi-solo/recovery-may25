@@ -12,20 +12,23 @@ from src.core.layer_attack_direction import AttackConfig, attack_pair_margin_pgd
 
 SCHEMA_VERSION = 1
 
-os.makedirs("results/outputs/directions", exist_ok=True)
+BASE = "results/outputs/global_verify_components"
+os.makedirs(f"{BASE}/directions", exist_ok=True)
 
 def _make_record(
     *,
     pair_id: int,
     prompt: str,
     completion: str,
-    completion_type: str,  # "chosen" | "rejected"
+    completion_type: str,
     reward_unperturbed: float,
     reward_perturbed: float,
-    perturbation_direction: torch.Tensor,  # (D,) float16 CPU
+    perturbation_direction: torch.Tensor,
     perturbation_type: str,
     cfg: AttackConfig,
     context_condition: str,
+    dataset: str,          # ← ADD THIS
+    split: str,            # ← ADD THIS
     extra: dict,
 ) -> dict:
     """
@@ -67,6 +70,8 @@ def _make_record(
         "per_token_l2": bool(cfg.per_token_l2),
         "max_length": int(cfg.max_length),
         "context_condition": context_condition,
+        "dataset": dataset,
+        "split": split,
     }
 
     # Any extras from the attack output (lengths, norms, etc.)
@@ -103,7 +108,8 @@ def run_one(
         layer = int(layer_env)
     else:
         layer = len(rm.model.layers) // 2
-    
+        
+    perturbation_mode = os.getenv("PERTURBATION_MODE", "shared")
     cfg = AttackConfig(
         layer=layer,
         epsilon=eps,
@@ -112,6 +118,7 @@ def run_one(
         max_length=int(os.getenv("MAX_LENGTH", "2048")),
         per_token_l2=bool(int(os.getenv("PER_TOKEN", "1"))),
         sign_flip=sign_flip,
+        perturbation_mode=perturbation_mode,
     )
     
     dataset_name = os.getenv("DATASET", "bbq")
@@ -149,14 +156,22 @@ def run_one(
             "clean_margin": float(out["clean_margin"]),
             "adv_margin": float(out["adv_margin"]),
             "flipped": bool(out["flipped"]),
-            "chosen_len_tokens": int(out["chosen_len_tokens"]),
-            "rejected_len_tokens": int(out["rejected_len_tokens"]),
-            "delta_global_l2": float(out["delta_global_l2"]),
-            "delta_max_token_l2": float(out["delta_max_token_l2"]),
-            "delta_mean_token_l2": float(out["delta_mean_token_l2"]),
-            "S_attack": int(out["S_attack"]),
-            "D_hidden": int(out["D_hidden"]),
         }
+        
+        if out.get("chosen_len_tokens") is not None:
+            common_extra["chosen_len_tokens"] = int(out["chosen_len_tokens"])
+        if out.get("rejected_len_tokens") is not None:
+            common_extra["rejected_len_tokens"] = int(out["rejected_len_tokens"])
+        if out.get("delta_global_l2") is not None:
+            common_extra["delta_global_l2"] = float(out["delta_global_l2"])
+        if out.get("delta_max_token_l2") is not None:
+            common_extra["delta_max_token_l2"] = float(out["delta_max_token_l2"])
+        if out.get("delta_mean_token_l2") is not None:
+            common_extra["delta_mean_token_l2"] = float(out["delta_mean_token_l2"])
+        if out.get("S_attack") is not None:
+            common_extra["S_attack"] = int(out["S_attack"])
+        if out.get("D_hidden") is not None:
+            common_extra["D_hidden"] = int(out["D_hidden"])
 
         common_extra["model_name"] = MODEL
         common_extra.update({f"bbq_{k}": v for k, v in ex.get("meta", {}).items()})
@@ -175,6 +190,8 @@ def run_one(
                 perturbation_type=perturbation_type,
                 cfg=cfg,
                 context_condition=context_condition,
+                dataset=dataset_name,
+                split=split,
                 extra=common_extra,
             )
         )
@@ -192,6 +209,8 @@ def run_one(
                 perturbation_type=perturbation_type,
                 cfg=cfg,
                 context_condition=context_condition,
+                dataset=dataset_name,
+                split=split,
                 extra=common_extra,
             )
         )
@@ -199,10 +218,10 @@ def run_one(
         if (i + 1) % 10 == 0:
             print(f"[{context_condition} | sign_flip={sign_flip}] {i+1}/{len(data)}")
 
-    tag = "flip" if sign_flip else "noflip"
+    tag = os.getenv("TAG", "flip" if sign_flip else "noflip")
     save_path = (
-        f"results/directions/"
-        f"{dataset_name}_{split}_seed{seed}_layer{cfg.layer}_"
+        f"{BASE}/directions/"
+        f"direction_records_{dataset_name}_{split}_seed{seed}_layer{cfg.layer}_"
         f"eps{cfg.epsilon}_{context_condition}_{tag}_n{n_total}.pt"
     )
 

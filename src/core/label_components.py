@@ -1,9 +1,10 @@
-# label_components.py
 import os
 import json
 import torch
+import glob
 
-LABELS_DIR = os.getenv("LABELS_DIR", "results/outputs/labels")
+BASE = "results/outputs/global_verify_components"
+LABELS_DIR = os.getenv("LABELS_DIR", f"{BASE}/labels")
 os.makedirs(LABELS_DIR, exist_ok=True)
 
 def render_example(rec):
@@ -15,13 +16,13 @@ def render_example(rec):
           {prompt, completion, completion_type, reward_unperturbed, reward_perturbed, ...}
     """
     if isinstance(rec, str):
-        # fallback, shouldn't happen in new pipeline
         return f"PROMPT: {rec.replace(chr(10), ' ')[:400]}"
 
     def clip(s, n):
         s = (s or "").replace("\n", " ").strip()
         return s[:n]
 
+    dataset = rec.get("dataset", "unknown")
     prompt = clip(rec.get("prompt", ""), 320)
     completion = clip(rec.get("completion", ""), 320)
     ctype = rec.get("completion_type", "unknown")
@@ -29,7 +30,6 @@ def render_example(rec):
     r0 = rec.get("reward_unperturbed", None)
     r1 = rec.get("reward_perturbed", None)
 
-    # reward delta is often useful context for interpretation
     if isinstance(r0, (float, int)) and isinstance(r1, (float, int)):
         r0f = float(r0)
         r1f = float(r1)
@@ -39,6 +39,7 @@ def render_example(rec):
         reward_line = "REWARD: (missing)"
 
     return (
+        f"DATASET: {dataset}\n"
         f"TYPE: {ctype}\n"
         f"{reward_line}\n"
         f"PROMPT: {prompt}\n"
@@ -76,7 +77,6 @@ Return JSON with keys: label, explanation, keywords, negatives.
 
 
 def call_openai(prompt: str, model: str = "gpt-4o-mini"):
-    # Requires: pip install openai
     from openai import OpenAI
     client = OpenAI()
 
@@ -88,6 +88,8 @@ def call_openai(prompt: str, model: str = "gpt-4o-mini"):
 
 
 def label_one(
+    dataset: str,
+    split: str,
     cc: str,
     tag: str,
     mode: str,
@@ -97,26 +99,35 @@ def label_one(
     n_default: int = 200,
     model: str = "gpt-4o-mini",
 ):
-    """
-    Loads PCA outputs produced by pca_directions.py and writes JSONL labels.
-
-    Filenames now match (note the mode and N):
-      results/pca_layer{layer}_eps{eps}_k{k}_{cc}_{tag}_{mode}_n{N}.pt
-
-    Where:
-      - mode is chosen|rejected|both
-      - N is number of records used for PCA:
-          chosen/rejected: N ≈ n_default
-          both: N ≈ 2*n_default
-    """
     seed_default = int(os.getenv("SEED", "0"))
-    pca_path = f"results/pca/pca_seed{seed_default}_layer{layer_default}_eps{eps_default}_k{k_default}_{cc}_{tag}_{mode}_n{n_default}.pt"
-    if not os.path.exists(pca_path):
-        print("missing (skipping):", pca_path)
-        return
+
+    global_pca = bool(int(os.getenv("GLOBAL_PCA", "0")))
+    scope_name = "global" if global_pca else dataset
+
+    if global_pca:
+        pattern = (
+            f"{BASE}/pca/"
+            f"pca_{scope_name}_{split}_seed{seed_default}_layer{layer_default}_"
+            f"eps{eps_default}_k{k_default}_{cc}_{tag}_{mode}_n*.pt"
+        )
+        matches = sorted(glob.glob(pattern))
+        if not matches:
+            print("missing (skipping):", pattern)
+            return
+        pca_path = matches[-1]
+    else:
+        pca_path = (
+            f"{BASE}/pca/"
+            f"pca_{scope_name}_{split}_seed{seed_default}_layer{layer_default}_"
+            f"eps{eps_default}_k{k_default}_{cc}_{tag}_{mode}_n{n_default}.pt"
+        )
+        if not os.path.exists(pca_path):
+            print("missing (skipping):", pca_path)
+            return
+        
     obj = torch.load(pca_path, map_location="cpu")
 
-    scores = obj["scores"]  # (N, K)
+    scores = obj["scores"]
     records = obj["records"]
     ids = obj["ids"]
     layer = obj["layer"]
@@ -127,12 +138,11 @@ def label_one(
     topM = 12
     botM = 6
 
-    seed_default = int(os.getenv("SEED", "0"))
     out_jsonl = os.path.join(
         LABELS_DIR,
-        f"component_labels_seed{seed_default}_layer{layer}_eps{eps}_K{K}_{cc}_{tag}_{mode_used}_n{len(records)}.jsonl"
+        f"component_labels_{scope_name}_{split}_seed{seed_default}_layer{layer}_"
+        f"eps{eps}_K{K}_{cc}_{tag}_{mode_used}_n{len(records)}.jsonl"
     )
-
 
     use_api = bool(os.getenv("OPENAI_API_KEY"))
 
@@ -141,7 +151,7 @@ def label_one(
             col = scores[:, k]
 
             top_vals, top_idx = torch.topk(col, k=min(topM, col.shape[0]))
-            bot_vals, bot_idx = torch.topk(-col, k=min(botM, col.shape[0]))  # most negative
+            bot_vals, bot_idx = torch.topk(-col, k=min(botM, col.shape[0]))
 
             top_recs = [records[i] for i in top_idx.tolist()]
             bot_recs = [records[i] for i in bot_idx.tolist()]
@@ -163,7 +173,7 @@ def label_one(
                     }
             else:
                 print("\n" + "=" * 80)
-                print(f"[{cc} | {tag} | mode={mode_used}] COMPONENT {k} PROMPT (copy into ChatGPT):\n")
+                print(f"[{scope_name} | {cc} | {tag} | mode={mode_used}] COMPONENT {k} PROMPT:\n")
                 print(prompt)
                 data = {"label": "MANUAL", "explanation": "", "keywords": [], "negatives": []}
 
@@ -174,11 +184,14 @@ def label_one(
                 "context_condition": cc,
                 "tag": tag,
                 "mode": mode_used,
+                "global_pca": bool(global_pca),
                 "pca_path": pca_path,
+                "datasets_used": obj.get("datasets_used", []),
+                "dataset_counts": obj.get("dataset_counts", {}),
                 "top_ids": [ids[i] for i in top_idx.tolist()],
                 "top_scores": [float(v) for v in top_vals.tolist()],
                 "bottom_ids": [ids[i] for i in bot_idx.tolist()],
-                "bottom_scores": [float(-v) for v in bot_idx.tolist()],
+                "bottom_scores": [float(v) for v in col[bot_idx].tolist()],
                 **data,
             }
             f.write(json.dumps(row) + "\n")
@@ -187,6 +200,8 @@ def label_one(
 
 
 def main():
+    dataset = os.getenv("DATASET", "bbq")
+    split = os.getenv("SPLIT", "train")
     cc_env = os.getenv("CC", None)
     tag_env = os.getenv("TAG", None)
 
@@ -195,16 +210,14 @@ def main():
     n_default = int(os.getenv("N", "200"))
     k_default = int(os.getenv("K", "10"))
 
-    # PCA mode must match how you ran pca_directions.py
-    # Examples:
-    #   MODE=chosen python pca_directions.py
-    #   MODE=chosen python label_components.py
-    mode = os.getenv("MODE", "chosen")  # chosen|rejected|both
+    mode = os.getenv("MODE", "chosen")
 
     cc = cc_env if cc_env is not None else "ambig"
     tag = tag_env if tag_env is not None else "flip"
 
     label_one(
+        dataset=dataset,
+        split=split,
         cc=cc,
         tag=tag,
         mode=mode,
